@@ -12,17 +12,26 @@ const extensionsDir = fs.existsSync(serverDir) ? serverDir : nativeDir
 
 fs.mkdirSync(extensionsDir, { recursive: true })
 
-const target = path.join(extensionsDir, 'falcra-vscode')
-
-if (fs.existsSync(target)) {
-	const stat = fs.lstatSync(target)
+// Remove a symlink at `p` if present. Uses lstat (not existsSync) so it also
+// clears DANGLING links — e.g. the old falcra-vscode link pointing at a path
+// that no longer exists after the move to mesh-x-vscode.
+function removeLink(p) {
+	let stat
+	try { stat = fs.lstatSync(p) } catch { return } // nothing there
 	if (stat.isSymbolicLink()) {
-		fs.unlinkSync(target)
+		fs.unlinkSync(p)
+		console.log(`Removed stale link: ${p}`)
 	} else {
-		console.error(`${target} exists and is not a symlink — remove it manually`)
+		console.error(`${p} exists and is not a symlink — remove it manually`)
 		process.exit(1)
 	}
 }
+
+// Clean up the legacy name from before the mesh-x rename.
+removeLink(path.join(extensionsDir, 'falcra-vscode'))
+
+const target = path.join(extensionsDir, 'mesh-x-vscode')
+removeLink(target)
 
 fs.symlinkSync(extensionDir, target, 'dir')
 console.log(`Linked: ${target} -> ${extensionDir}`)

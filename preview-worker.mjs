@@ -3,8 +3,8 @@
  * Reads a JSON request from stdin, imports a JSX component,
  * calls it with props, and writes the resulting GLB to outPath.
  *
- * Resolves @starbor/falcra-glb from the assetsDir context (passed in request)
- * so this file can live in falcra-vscode without needing falcra-glb as a dependency.
+ * Resolves mesh-x from the project context (assetsDir, passed in request)
+ * so the extension doesn't need mesh-x as a direct dependency.
  *
  * Stdin JSON: { componentPath, props, atlasDir, assetsDir, outPath, mounts }
  * Stderr JSON: { ok: true, byteLength, meshCount, mountTree } or { ok: false, error }
@@ -19,11 +19,13 @@ import { readFileSync, existsSync } from 'node:fs'
  * stopping at mount boundaries (don't recurse into another Mount_* empty).
  */
 function discoverDirectMounts(node, Empty) {
-	const names = []
+	const mounts = []
 	function recurse(n) {
 		for (const child of n.children) {
 			if (child instanceof Empty && child.name && child.name.startsWith('Mount_')) {
-				names.push(child.name)
+				// `accepts` (set on the <Empty> in JSX) is the component type this socket
+				// can hold — surfaced so the editor can filter the per-mount dropdown.
+				mounts.push({ name: child.name, accepts: child.accepts || null })
 				// Don't recurse into this mount — it's a boundary
 			} else {
 				recurse(child)
@@ -31,7 +33,7 @@ function discoverDirectMounts(node, Empty) {
 		}
 	}
 	recurse(node)
-	return names
+	return mounts
 }
 
 /**
@@ -46,19 +48,21 @@ async function resolveMountsTree(node, mountsConfig, assetsDir, Empty, Scene, at
 	const directMounts = discoverDirectMounts(node, Empty)
 	const tree = []
 
-	for (const mountName of directMounts) {
+	for (const { name: mountName, accepts } of directMounts) {
 		const mountConfig = (mountsConfig && mountsConfig[mountName]) || {}
-		const treeNode = { name: mountName, component: mountConfig.component || null, childMounts: [] }
+		const treeNode = { name: mountName, accepts, component: mountConfig.component || null, childMounts: [] }
 
 		if (mountConfig.component) {
 			const componentRef = mountConfig.component
 
-			// Circular ref detection
+			// Circular-ref detection: block only a true ANCESTOR cycle (a component
+			// that transitively mounts itself). `visited` is the chain of ancestors on
+			// THIS branch — NOT mutated here, so sibling sockets reusing the same
+			// component (e.g. a Rocket in every RocketPod tube) each still build.
 			if (visited.has(componentRef)) {
 				tree.push(treeNode)
 				continue
 			}
-			visited.add(componentRef)
 
 			// Resolve component path
 			const jsxPath = resolve(assetsDir, 'src', componentRef + '.jsx')
@@ -67,11 +71,11 @@ async function resolveMountsTree(node, mountsConfig, assetsDir, Empty, Scene, at
 				continue
 			}
 
-			// Read .falcra.json defaults for the component
+			// Read .meshx.json defaults for the component
 			const parts = componentRef.split('/')
 			const componentName = parts[parts.length - 1]
 			const componentDir = resolve(assetsDir, 'src', ...parts.slice(0, -1))
-			const configPath = join(componentDir, componentName + '.falcra.json')
+			const configPath = join(componentDir, componentName + '.meshx.json')
 			let componentProps = {}
 			if (existsSync(configPath)) {
 				try {
@@ -110,9 +114,11 @@ async function resolveMountsTree(node, mountsConfig, assetsDir, Empty, Scene, at
 				mountPoint.add(childNode)
 			}
 
-			// Recurse into built component's mount empties
+			// Recurse into built component's mount empties. Pass a fresh ancestor
+			// chain (visited + this component) so the cycle guard is path-scoped and
+			// siblings don't see each other's components.
 			treeNode.childMounts = await resolveMountsTree(
-				mountPoint, mountConfig.mounts || {}, assetsDir, Empty, Scene, atlasDir, visited
+				mountPoint, mountConfig.mounts || {}, assetsDir, Empty, Scene, atlasDir, new Set(visited).add(componentRef)
 			)
 		}
 
@@ -130,9 +136,9 @@ async function run() {
 	const input = JSON.parse(Buffer.concat(chunks).toString('utf8'))
 	const { componentPath, props, atlasDir, assetsDir, outPath, mounts } = input
 
-	// Resolve falcra-glb from falcra-assets' node_modules
+	// Resolve mesh-x from the project's node_modules (assetsDir = discovered project root)
 	const assetRequire = createRequire(join(assetsDir, 'package.json'))
-	const glbPath = assetRequire.resolve('@starbor/falcra-glb')
+	const glbPath = assetRequire.resolve('mesh-x')
 	const { Scene, Empty, writeGlb } = await import(glbPath)
 
 	const mod = await import(`${componentPath}?t=${Date.now()}`)
@@ -154,7 +160,7 @@ async function run() {
 
 	// Detect and serialize procedural animations
 	let animations = null
-	const configPath = componentPath.replace(/\.jsx$/, '.falcra.json')
+	const configPath = componentPath.replace(/\.jsx$/, '.meshx.json')
 	if (existsSync(configPath)) {
 		try {
 			const config = JSON.parse(readFileSync(configPath, 'utf8'))

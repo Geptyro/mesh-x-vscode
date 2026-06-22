@@ -50,12 +50,40 @@ function getNodeBin() {
 }
 
 /**
+ * Find the asset PROJECT ROOT for a given component file: the nearest ancestor
+ * directory from which `mesh-x` resolves — i.e. one that has node_modules/mesh-x,
+ * or that IS the mesh-x package (so the package's own examples work via Node's
+ * package self-reference). Falls back to the file's own directory.
+ *
+ * This replaces the old hardcoded `../falcra-assets` assumption, so the extension
+ * works for ANY mesh-x asset project (and for self-contained color-mode assets
+ * that have no atlas at all).
+ */
+function findProjectRoot(startPath) {
+	let dir = fs.existsSync(startPath) && fs.statSync(startPath).isDirectory()
+		? startPath
+		: path.dirname(startPath)
+	for (let i = 0; i < 20; i++) {
+		// A consumer project: has mesh-x installed.
+		if (fs.existsSync(path.join(dir, 'node_modules', 'mesh-x'))) return dir
+		// The mesh-x package itself (its examples self-reference by name).
+		try {
+			const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+			if (pkg.name === 'mesh-x') return dir
+		} catch { /* no package.json here */ }
+		const parent = path.dirname(dir)
+		if (parent === dir) break
+		dir = parent
+	}
+	return path.dirname(startPath)
+}
+
+/**
  * Spawns preview-worker.js as a child process to build a component to GLB.
  * Returns a Buffer of the GLB file contents.
  */
 class BuildBridge {
 	constructor(extensionPath, output) {
-		// Resolve symlink so ../falcra-assets works (VS Code reports the symlink path)
 		this._extensionPath = fs.realpathSync(extensionPath)
 		this._output = output
 		this._pending = null
@@ -81,25 +109,28 @@ class BuildBridge {
 		const handle = { cancelled: false }
 		this._pending = handle
 
-		const outPath = path.join(os.tmpdir(), `falcra-preview-${seq}.glb`)
-		const assetsDir = path.resolve(this._extensionPath, '..', 'falcra-assets')
+		const outPath = path.join(os.tmpdir(), `meshx-preview-${seq}.glb`)
+		// Project root discovered from the component being previewed — the cwd from
+		// which `mesh-x` (the loader + the worker's engine import) resolves. No
+		// hardcoded project path; works for any mesh-x asset project.
+		const projectRoot = findProjectRoot(componentPath)
 		const workerPath = path.join(this._extensionPath, 'preview-worker.mjs')
-		const loaderPath = path.join(assetsDir, 'jsx-loader.js')
+		const loaderPath = 'mesh-x/pipeline/jsx-loader.js' // resolved from projectRoot cwd
 
-		const request = JSON.stringify({ componentPath, props, atlasDir, assetsDir, outPath, mounts })
+		const request = JSON.stringify({ componentPath, props, atlasDir, assetsDir: projectRoot, outPath, mounts })
 
 		try {
 			const nodeBin = getNodeBin()
 			this._output.appendLine(`[build] node: ${nodeBin}`)
 			this._output.appendLine(`[build] worker: ${workerPath}`)
 			this._output.appendLine(`[build] loader: ${loaderPath}`)
-			this._output.appendLine(`[build] cwd: ${path.resolve(this._extensionPath, '..', 'falcra-assets')}`)
+			this._output.appendLine(`[build] cwd: ${projectRoot}`)
 			const result = await new Promise((resolve, reject) => {
 				const child = spawn(nodeBin, [
 					'--import', loaderPath,
 					workerPath,
 				], {
-					cwd: path.resolve(this._extensionPath, '..', 'falcra-assets'),
+					cwd: projectRoot,
 					stdio: ['pipe', 'pipe', 'pipe'],
 					env: { ...process.env, NODE_NO_WARNINGS: '1' },
 				})
@@ -169,4 +200,4 @@ class BuildBridge {
 	}
 }
 
-module.exports = { BuildBridge }
+module.exports = { BuildBridge, getNodeBin, findProjectRoot }

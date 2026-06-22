@@ -1,5 +1,6 @@
 <script>
 	import SwatchGrid from './SwatchGrid.svelte'
+	import MaterialControl from './MaterialControl.svelte'
 
 	let { key, def, value, onchange } = $props()
 
@@ -7,7 +8,7 @@
 	let textareaInvalid = $state(false)
 
 	$effect(() => {
-		if (def.type !== 'number' && def.type !== 'int' && def.type !== 'swatch' && def.type !== 'boolean') {
+		if (def.type !== 'number' && def.type !== 'int' && def.type !== 'swatch' && def.type !== 'boolean' && def.type !== 'material') {
 			textareaValue = JSON.stringify(value !== undefined ? value : def.default, null, 2)
 			textareaInvalid = false
 		}
@@ -57,6 +58,8 @@
 	</div>
 {:else if def.type === 'swatch'}
 	<SwatchGrid value={value || def.default} onchange={onchange} />
+{:else if def.type === 'material'}
+	<MaterialControl value={value !== undefined ? value : def.default} onchange={onchange} />
 {:else if def.type === 'boolean'}
 	<input
 		type="checkbox"

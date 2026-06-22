@@ -1,12 +1,16 @@
 <script>
 	import MountNode from './MountNode.svelte'
-	import { editor } from '../stores/editor.svelte.js'
+	import { editor, acceptedComponents } from '../stores/editor.svelte.js'
 	import { postMessage } from '../stores/messages.svelte.js'
 	import PropControl from './PropControl.svelte'
 
 	let { node, pathArr, depth = 0 } = $props()
 
 	let propsExpanded = $state(false)
+
+	// Components this socket may hold, filtered by the type it accepts. An
+	// undeclared socket (no `accepts`) yields an empty list — nothing to pick.
+	const options = $derived(acceptedComponents(node.accepts))
 
 	function onMountChange(e) {
 		const component = e.target.value || null
@@ -19,14 +23,23 @@
 </script>
 
 <div class="mount-row" style="padding-left: {12 + depth * 16}px">
-	<span class="mount-label">{node.name.replace('Mount_', '')}</span>
+	<span class="mount-label" title={node.accepts ? 'accepts: ' + node.accepts : 'no accepted type declared'}>
+		{node.name.replace('Mount_', '')}
+		{#if node.accepts}<span class="mount-type">{node.accepts.split('/').pop()}</span>{/if}
+	</span>
 	{#if editor.isPreview}
-		<select class="mount-select" value={node.component || ''} onchange={onMountChange}>
-			<option value="">(None)</option>
-			{#each editor.availableComponents as comp}
-				<option value={comp} title={comp}>{comp.split('/').pop()}</option>
-			{/each}
-		</select>
+		{#if !node.accepts}
+			<span class="mount-info">no type declared</span>
+		{:else if options.length === 0}
+			<span class="mount-info">no {node.accepts.split('/').pop()} components</span>
+		{:else}
+			<select class="mount-select" value={node.component || ''} onchange={onMountChange}>
+				<option value="">(None)</option>
+				{#each options as comp}
+					<option value={comp} title={comp}>{comp.split('/').pop()}</option>
+				{/each}
+			</select>
+		{/if}
 	{:else}
 		<span class="mount-info">mount point</span>
 	{/if}
@@ -74,6 +87,16 @@
 		color: var(--vscode-descriptionForeground, #999);
 		white-space: nowrap;
 		min-width: 50px;
+	}
+	.mount-type {
+		display: inline-block;
+		margin-left: 4px;
+		padding: 0 4px;
+		border-radius: 2px;
+		font-size: 9px;
+		color: var(--vscode-badge-foreground, #fff);
+		background: var(--vscode-badge-background, #4d4d4d);
+		vertical-align: middle;
 	}
 	.mount-select {
 		flex: 1;

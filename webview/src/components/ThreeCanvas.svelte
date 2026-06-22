@@ -5,7 +5,8 @@
 	import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 	import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js'
 	import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js'
-	import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js'
+	import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
+	import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
 	import { createIKSolver } from '../lib/ikSolver.js'
 	import { discoverMorphAnims } from '../lib/morphDiscovery.js'
 	import { computeSceneStats } from '../lib/sceneStats.js'
@@ -18,10 +19,11 @@
 	let panelEl
 
 	// Three.js objects — plain local vars, NOT reactive
-	let renderer, scene, camera, controls, composer, bloomPass
+	let renderer, scene, camera, controls, composer
 	let modelGroup, loader, clock
 	let mixer = null
 	let boneMap = {}
+	let mirrorBones = [] // [[primaryBone, secondaryBone], ...] for mounted skeletons
 	let skeletonHelper = null
 	let ikSolver = null
 	let morphMesh = null
@@ -36,10 +38,27 @@
 		renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true })
 		renderer.setPixelRatio(window.devicePixelRatio)
 		renderer.outputColorSpace = THREE.SRGBColorSpace
+		// Tone mapping: without it, bright specular/metal reflections clip linearly to
+		// pure white, so any low-roughness swatch reads as "blown out / reflects too
+		// much light". ACES Filmic rolls highlights off smoothly instead. Applied at
+		// the end of the composer via OutputPass below (the renderer setting alone is
+		// ignored once an EffectComposer is in play).
+		renderer.toneMapping = THREE.ACESFilmicToneMapping
+		// Match the game's exposure (Entrypoint/OpenWorld set 1.3). The game gets its
+		// brightness from exposure on top of a single sun + IBL, NOT from extra lights.
+		renderer.toneMappingExposure = 1.3
 
 		// Scene
 		scene = new THREE.Scene()
 		scene.background = new THREE.Color(0xbfbfbf)
+
+		// Image-based lighting: metallic PBR surfaces have no diffuse — they render
+		// purely by reflecting an environment. Without one, metals are black (only a
+		// pinpoint specular highlight). A neutral RoomEnvironment gives them
+		// something to reflect so they show their actual color/shininess.
+		const pmrem = new THREE.PMREMGenerator(renderer)
+		scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture
+		pmrem.dispose()
 
 		// Camera
 		camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100)
@@ -50,22 +69,26 @@
 		controls.enableDamping = true
 		controls.dampingFactor = 0.1
 
-		// Lighting
-		const ambientLight = new THREE.AmbientLight(0xffffff, 3.0)
-		scene.add(ambientLight)
-		const dirLight = new THREE.DirectionalLight(0xffffff, 3.0)
+		// Lighting — mirror the game (Entrypoint/OpenWorld): the RoomEnvironment IBL
+		// above IS the ambient/indirect term, so do NOT add a flat AmbientLight on top
+		// (stacking double-counts indirect light and washes out high-albedo painted
+		// swatches like Armor_White — exactly the "white reads way too bright" bug).
+		// The game uses a single sun @ 1.6; we keep one small fill so backsides aren't
+		// black while orbiting, but nothing strong enough to blow out diffuse surfaces.
+		const dirLight = new THREE.DirectionalLight(0xffeedd, 1.6)
 		dirLight.position.set(3, 5, 4)
 		scene.add(dirLight)
-		const fillLight = new THREE.DirectionalLight(0xffffff, 1.5)
+		const fillLight = new THREE.DirectionalLight(0xffffff, 0.25)
 		fillLight.position.set(-3, 2, -2)
 		scene.add(fillLight)
-		const backLight = new THREE.DirectionalLight(0xffffff, 1.0)
-		backLight.position.set(0, 3, -4)
-		scene.add(backLight)
 
 		// Grid
 		const grid = new THREE.GridHelper(10, 40, 0x999999, 0xaaaaaa)
 		scene.add(grid)
+
+		// Axes (R=X, G=Y, B=Z)
+		const axes = new THREE.AxesHelper(0.5)
+		scene.add(axes)
 
 		// Model container
 		modelGroup = new THREE.Group()
@@ -74,11 +97,21 @@
 		loader = new GLTFLoader()
 		clock = new THREE.Clock()
 
-		// Post-processing
+		// Post-processing. NO bloom: the atlas emission map is NOT HDR — the per-swatch
+		// `emission` strength (e.g. Glow_White 8.0) is only an on/off gate in
+		// generateAtlas, so an emissive texel maxes at the swatch's base colour (~0.8-1.0
+		// linear). That is actually DIMMER than a sunlit high-albedo painted surface
+		// (Armor_White, albedo 0.78, reads ~1.0-1.3 linear), so any bloom threshold low
+		// enough to catch the glows catches the white armour FIRST — which is exactly the
+		// "white reflects way too much light / glows" report. UnrealBloom also runs on the
+		// pre-tone-map linear buffer, so lowering exposure can't tame it. The game render
+		// path has no bloom either, so we drop it; emissive swatches still read as bright,
+		// just without a halo.
 		composer = new EffectComposer(renderer)
 		composer.addPass(new RenderPass(scene, camera))
-		bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.4, 0.5, 0.7)
-		composer.addPass(bloomPass)
+		// Final pass: applies renderer.toneMapping (ACES) + output color-space
+		// conversion. Required for tone mapping to take effect through an EffectComposer.
+		composer.addPass(new OutputPass())
 
 		// Resize
 		function resize() {
@@ -135,6 +168,10 @@
 				} else if (hasAnim) {
 					anim.proceduralAnims[anim.currentProceduralAnim].fn(animElapsed, boneMap, anim.animSpeed, ikSolver)
 				}
+				// Sync mounted skeleton bones to match primary
+				for (const [primary, secondary] of mirrorBones) {
+					secondary.rotation.copy(primary.rotation)
+				}
 			} else if (mixer) {
 				mixer.update(delta)
 			} else if (anim.morphAnims && morphMesh) {
@@ -170,6 +207,7 @@
 			loadGLB,
 			getDrawCalls: () => renderer.info.render.calls,
 			getMorphMesh: () => morphMesh,
+			refreshAtlas,
 		})
 
 		return () => {
@@ -203,6 +241,17 @@
 		controls.update()
 	}
 
+	// Invalidate the cached atlas material so the next ensureAtlasMaterial() reloads
+	// the (regenerated) atlas PNGs. Called after a live swatch/atlas edit.
+	function refreshAtlas() {
+		if (!atlasMaterial) return
+		for (const m of [atlasMaterial.map, atlasMaterial.roughnessMap, atlasMaterial.emissiveMap, atlasMaterial.normalMap]) {
+			if (m) m.dispose()
+		}
+		atlasMaterial.dispose()
+		atlasMaterial = null
+	}
+
 	function ensureAtlasMaterial() {
 		if (atlasMaterial) return atlasMaterial
 		const urls = editor.atlasTextures
@@ -222,6 +271,16 @@
 		emission.wrapS = THREE.RepeatWrapping
 		emission.wrapT = THREE.RepeatWrapping
 
+		// Tangent-space normal map (optional — older atlases have none). Linear color
+		// space (NOT sRGB) so the encoded normals aren't gamma-distorted.
+		let normal = null
+		if (urls.atlas_normal) {
+			normal = textureLoader.load(urls.atlas_normal)
+			normal.flipY = false
+			normal.wrapS = THREE.RepeatWrapping
+			normal.wrapT = THREE.RepeatWrapping
+		}
+
 		atlasMaterial = new THREE.MeshStandardMaterial({
 			map: baseColor,
 			roughnessMap: orm,
@@ -231,6 +290,16 @@
 			aoMap: orm,
 			emissiveMap: emission,
 			emissive: new THREE.Color(1, 1, 1),
+			normalMap: normal,
+			normalScale: new THREE.Vector2(2.0, 2.0),
+			// Dial down how hard the studio RoomEnvironment reflects — at full strength
+			// semi-gloss painted surfaces read as overly shiny/wet. 0.4 keeps a subtle
+			// sheen without the mirror look.
+			envMapIntensity: 0.4,
+			// NO vertexColors: mesh-x GLBs carry no COLOR_0 attribute, so enabling it
+			// makes the (absent) vertex color default to ~0 and multiplies every
+			// painted/dielectric base color down to gray-black. (Metals looked OK only
+			// because they reflect the environment regardless of base color.)
 		})
 		return atlasMaterial
 	}
@@ -269,11 +338,16 @@
 
 			modelGroup.add(gltf.scene)
 
-			// Apply atlas material (GLBs are texture-less, UVs map to shared atlas)
+			// Apply the shared atlas material to swatch-driven meshes (GLBs are
+			// texture-less, UVs map to the atlas). Meshes carrying their own inline
+			// material — named Material_* by writeGlb, e.g. a `material`-prop mesh —
+			// keep the PBR material GLTFLoader built, so the material field shows live.
 			const mat = ensureAtlasMaterial()
 			if (mat) {
 				gltf.scene.traverse(obj => {
-					if (obj.isMesh) obj.material = mat
+					if (obj.isMesh && obj.material && obj.material.name === 'Atlas_Material') {
+						obj.material = mat
+					}
 				})
 			}
 
@@ -292,11 +366,16 @@
 				}
 			})
 
-			// Build boneMap from skeleton
+			// Build boneMap from skeleton (first skeleton wins, duplicates become mirrors)
+			mirrorBones = []
 			gltf.scene.traverse(obj => {
 				if (obj.isSkinnedMesh && obj.skeleton) {
 					for (const bone of obj.skeleton.bones) {
-						boneMap[bone.name] = bone
+						if (boneMap[bone.name]) {
+							mirrorBones.push([boneMap[bone.name], bone])
+						} else {
+							boneMap[bone.name] = bone
+						}
 					}
 				}
 			})
